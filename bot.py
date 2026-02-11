@@ -11,37 +11,39 @@ from telegram.ext import (
 )
 from telethon import TelegramClient, errors
 
-# =================================
+# =========================
 # ENV VARIABLES
-# =================================
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-# =================================
-# FILES & DIRECTORIES
-# =================================
+# =========================
+# FILES
+# =========================
 DATA_FILE = "data.json"
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# =================================
+# =========================
 # DATABASE
-# =================================
+# =========================
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
     return json.load(open(DATA_FILE))
 
+
 def save_data(d):
     json.dump(d, open(DATA_FILE, "w"), indent=2)
 
+
 db = load_data()
 
-# =================================
+# =========================
 # KEYBOARD
-# =================================
+# =========================
 def keyboard():
     return ReplyKeyboardMarkup(
         [
@@ -55,9 +57,9 @@ def keyboard():
         resize_keyboard=True,
     )
 
-# =================================
-# HELPERS
-# =================================
+# =========================
+# USER HELPERS
+# =========================
 def get_user(uid):
     uid = str(uid)
     if uid not in db:
@@ -71,46 +73,46 @@ def get_user(uid):
         }
     return db[uid]
 
-async def get_client(uid):
-    return TelegramClient(f"{SESSIONS_DIR}/{uid}", API_ID, API_HASH)
 
-# =================================
+async def get_client(uid):
+    client = TelegramClient(f"{SESSIONS_DIR}/{uid}", API_ID, API_HASH)
+    await client.connect()
+    return client
+
+# =========================
 # ADS LOOP
-# =================================
+# =========================
 async def ads_loop(uid):
     user = get_user(uid)
-    session_file = f"{SESSIONS_DIR}/{uid}"
-
-    while user["running"]:
-        try:
-            async with TelegramClient(session_file, API_ID, API_HASH) as client:
-                for chat in user["chats"]:
-                    try:
-                        await client.send_message(chat, user["message"])
-                    except Exception:
-                        continue
+    client = await get_client(uid)
+    try:
+        while user["running"]:
+            for chat in user["chats"]:
+                try:
+                    await client.send_message(chat, user["message"])
+                except errors.FloodWaitError as e:
+                    await asyncio.sleep(e.seconds)
+                except Exception:
+                    await asyncio.sleep(5)
             await asyncio.sleep(user["interval"])
-        except Exception:
-            await asyncio.sleep(5)
+    finally:
+        await client.disconnect()
 
-# =================================
+# =========================
 # START COMMAND
-# =================================
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚀 AdBot running smoothly!",
-        reply_markup=keyboard(),
-    )
+    await update.message.reply_text("🚀 Bot Ready", reply_markup=keyboard())
 
-# =================================
+# =========================
 # MAIN TEXT HANDLER
-# =================================
+# =========================
 async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
     uid = update.message.from_user.id
     user = get_user(uid)
 
-    # ===== LOGIN =====
+    # ===== LOGIN FLOW =====
     if msg == "📱 Login":
         user["state"] = "phone"
         save_data(db)
@@ -119,15 +121,18 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user["state"] == "phone":
         user["phone"] = msg
-        session_file = f"{SESSIONS_DIR}/{uid}"
+        client = await get_client(uid)
         try:
-            async with TelegramClient(session_file, API_ID, API_HASH) as client:
-                await client.send_code_request(msg)
-            user["state"] = "otp"
-            save_data(db)
-            await update.message.reply_text("Send OTP like: code12345")
+            await client.send_code_request(msg)
         except Exception as e:
-            await update.message.reply_text(f"❌ Error sending code: {str(e)}")
+            await update.message.reply_text(f"❌ Error sending code: {e}")
+            user["state"] = None
+            save_data(db)
+            return
+
+        user["state"] = "otp"
+        save_data(db)
+        await update.message.reply_text("Send OTP like: code12345")
         return
 
     if user["state"] == "otp":
@@ -135,17 +140,14 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Format must be: code12345")
             return
         code = msg[4:]
-        session_file = f"{SESSIONS_DIR}/{uid}"
+        client = await get_client(uid)
         try:
-            async with TelegramClient(session_file, API_ID, API_HASH) as client:
-                await client.sign_in(user["phone"], code)
+            await client.sign_in(user["phone"], code)
             user["state"] = None
             save_data(db)
             await update.message.reply_text("✅ Login successful")
-        except errors.SessionPasswordNeededError:
-            await update.message.reply_text("Two-step verification required. Cannot login.")
         except Exception as e:
-            await update.message.reply_text(f"❌ OTP login failed: {str(e)}")
+            await update.message.reply_text(f"❌ Login failed: {e}")
         return
 
     # ===== LOGOUT =====
@@ -208,18 +210,20 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user["state"] == "interval":
         try:
             user["interval"] = int(msg)
+            user["state"] = None
+            save_data(db)
+            await update.message.reply_text("Interval updated")
         except ValueError:
-            await update.message.reply_text("Please send a valid number")
-            return
-        user["state"] = None
-        save_data(db)
-        await update.message.reply_text("Interval updated")
+            await update.message.reply_text("Send a valid number")
         return
 
     # ===== ADS =====
     if msg == "▶ Start Ads":
         if not user["chats"]:
             await update.message.reply_text("Add chats first")
+            return
+        if user["running"]:
+            await update.message.reply_text("Ads already running")
             return
         user["running"] = True
         save_data(db)
@@ -242,15 +246,17 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Message:\n{user['message']}"
         )
 
-# =================================
+
+# =========================
 # MAIN
-# =================================
+# =========================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT, text))
-    print("🚀 Bot running smoothly")
+    print("🚀 Bot running")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
