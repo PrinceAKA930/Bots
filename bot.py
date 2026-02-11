@@ -107,7 +107,7 @@ async def login(e):
     )
 
 
-@bot.on(events.NewMessage)
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in states))
 async def otp_handler(e):
     uid = e.sender_id
 
