@@ -90,10 +90,21 @@ async def get_client(uid):
 
 # ================= LOGIN =================
 
+# ================= LOGIN =================
+
 @bot.on(events.NewMessage(pattern="📱 Login"))
 async def login(e):
-    states[e.sender_id] = {"step": "phone"}
-    await e.reply("Send phone number with country code\nExample: +919999999999")
+    uid = e.sender_id
+
+    states[uid] = {
+        "step": "phone",
+        "phone": None,
+        "hash": None
+    }
+
+    await e.reply(
+        "📱 Send phone number with country code\nExample:\n+919999999999"
+    )
 
 
 @bot.on(events.NewMessage)
@@ -104,46 +115,92 @@ async def otp_handler(e):
         return
 
     st = states[uid]
-    client = await get_client(uid)
 
-    # PHONE STEP
+    # ---------------- PHONE STEP ----------------
     if st["step"] == "phone":
         phone = e.raw_text.strip()
-        result = await client.send_code_request(phone)
-        st["phone"] = phone
-        st["hash"] = result.phone_code_hash
-        st["step"] = "otp"
 
-        await e.reply("Send OTP like:\ncode12345")
-        return
-
-    # OTP STEP
-    if st["step"] == "otp" and e.raw_text.lower().startswith("code"):
-        code = e.raw_text.replace("code", "").strip()
+        if not phone.startswith("+"):
+            await e.reply("❌ Invalid format\nUse: +919999999999")
+            return
 
         try:
-            await client.sign_in(st["phone"], code, phone_code_hash=st["hash"])
-            states.pop(uid)
-            await e.reply("✅ Login successful", buttons=main_buttons())
+            client = await get_client(uid)
+
+            if not client.is_connected():
+                await client.connect()
+
+            result = await client.send_code_request(phone)
+
+            st["phone"] = phone
+            st["hash"] = result.phone_code_hash
+            st["step"] = "otp"
+
+            await e.reply("📩 Send OTP like:\ncode12345")
+
+        except Exception as ex:
+            await e.reply(f"❌ Failed sending OTP:\n{ex}")
+
+        return
+
+
+    # ---------------- OTP STEP ----------------
+    if st["step"] == "otp":
+        text = e.raw_text.strip().lower()
+
+        if not text.startswith("code"):
+            return
+
+        code = text.replace("code", "").strip()
+
+        try:
+            client = await get_client(uid)
+
+            if not client.is_connected():
+                await client.connect()
+
+            await client.sign_in(
+                st["phone"],
+                code,
+                phone_code_hash=st["hash"]
+            )
+
+            states.pop(uid, None)
+
+            await e.reply(
+                "✅ Login successful",
+                buttons=main_buttons()
+            )
 
         except SessionPasswordNeededError:
             st["step"] = "2fa"
-            await e.reply("Send your 2FA password")
+            await e.reply("🔐 Send your 2FA password")
 
         except Exception as ex:
-            await e.reply(f"❌ OTP failed: {ex}")
+            await e.reply(f"❌ OTP failed:\n{ex}")
+
         return
 
-    # 2FA
+
+    # ---------------- 2FA STEP ----------------
     if st["step"] == "2fa":
         try:
-            await client.sign_in(password=e.raw_text)
-            states.pop(uid)
-            await e.reply("✅ Login successful", buttons=main_buttons())
+            client = await get_client(uid)
+
+            if not client.is_connected():
+                await client.connect()
+
+            await client.sign_in(password=e.raw_text.strip())
+
+            states.pop(uid, None)
+
+            await e.reply(
+                "✅ Login successful",
+                buttons=main_buttons()
+            )
+
         except Exception as ex:
-            await e.reply(str(ex))
-
-
+            await e.reply(f"❌ 2FA failed:\n{ex}")
 # ================= LOGOUT =================
 
 @bot.on(events.NewMessage(pattern="🚪 Logout"))
