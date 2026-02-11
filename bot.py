@@ -9,21 +9,19 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 
 # =================================
-# ENV
+# ENV VARIABLES
 # =================================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
 # =================================
-# FILES
+# FILES & DIRECTORIES
 # =================================
-
 DATA_FILE = "data.json"
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -31,23 +29,19 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 # =================================
 # DATABASE
 # =================================
-
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
     return json.load(open(DATA_FILE))
 
-
 def save_data(d):
     json.dump(d, open(DATA_FILE, "w"), indent=2)
-
 
 db = load_data()
 
 # =================================
 # KEYBOARD
 # =================================
-
 def keyboard():
     return ReplyKeyboardMarkup(
         [
@@ -64,7 +58,6 @@ def keyboard():
 # =================================
 # HELPERS
 # =================================
-
 def get_user(uid):
     uid = str(uid)
     if uid not in db:
@@ -84,85 +77,86 @@ async def get_client(uid):
 # =================================
 # ADS LOOP
 # =================================
-
 async def ads_loop(uid):
     user = get_user(uid)
-    client = await get_client(uid)
-    await client.connect()
+    session_file = f"{SESSIONS_DIR}/{uid}"
 
     while user["running"]:
         try:
-            for chat in user["chats"]:
-                await client.send_message(chat, user["message"])
+            async with TelegramClient(session_file, API_ID, API_HASH) as client:
+                for chat in user["chats"]:
+                    try:
+                        await client.send_message(chat, user["message"])
+                    except Exception:
+                        continue
             await asyncio.sleep(user["interval"])
-        except:
+        except Exception:
             await asyncio.sleep(5)
 
-    await client.disconnect()
-
 # =================================
-# START
+# START COMMAND
 # =================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 AdBot is Ready!",
+        "🚀 AdBot running smoothly!",
         reply_markup=keyboard(),
     )
 
 # =================================
 # MAIN TEXT HANDLER
 # =================================
-
 async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
     uid = update.message.from_user.id
     user = get_user(uid)
 
-    # =========================
-    # LOGIN FLOW
-    # =========================
+    # ===== LOGIN =====
     if msg == "📱 Login":
         user["state"] = "phone"
         save_data(db)
-        await update.message.reply_text("Send your phone number (+91xxxx)")
+        await update.message.reply_text("Send phone number (+91xxxx)")
         return
 
     if user["state"] == "phone":
         user["phone"] = msg
-        client = await get_client(uid)
-        await client.connect()
-        await client.send_code_request(msg)
-        user["state"] = "otp"
-        save_data(db)
-        await update.message.reply_text("Send OTP like: code12345")
+        session_file = f"{SESSIONS_DIR}/{uid}"
+        try:
+            async with TelegramClient(session_file, API_ID, API_HASH) as client:
+                await client.send_code_request(msg)
+            user["state"] = "otp"
+            save_data(db)
+            await update.message.reply_text("Send OTP like: code12345")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error sending code: {str(e)}")
         return
 
     if user["state"] == "otp":
         if not msg.startswith("code"):
-            await update.message.reply_text("OTP format must be: code12345")
+            await update.message.reply_text("Format must be: code12345")
             return
         code = msg[4:]
-        client = await get_client(uid)
-        await client.sign_in(user["phone"], code)
-        user["state"] = None
-        save_data(db)
-        await update.message.reply_text("✅ Login successful")
+        session_file = f"{SESSIONS_DIR}/{uid}"
+        try:
+            async with TelegramClient(session_file, API_ID, API_HASH) as client:
+                await client.sign_in(user["phone"], code)
+            user["state"] = None
+            save_data(db)
+            await update.message.reply_text("✅ Login successful")
+        except errors.SessionPasswordNeededError:
+            await update.message.reply_text("Two-step verification required. Cannot login.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ OTP login failed: {str(e)}")
         return
 
-    # =========================
-    # LOGOUT
-    # =========================
+    # ===== LOGOUT =====
     if msg == "🚪 Logout":
-        session = f"{SESSIONS_DIR}/{uid}.session"
-        if os.path.exists(session):
-            os.remove(session)
+        session_file = f"{SESSIONS_DIR}/{uid}.session"
+        if os.path.exists(session_file):
+            os.remove(session_file)
         await update.message.reply_text("Logged out")
         return
 
-    # =========================
-    # SET MESSAGE
-    # =========================
+    # ===== SET MESSAGE =====
     if msg == "📝 Set Message":
         user["state"] = "set_message"
         await update.message.reply_text("Send your ad message text")
@@ -175,9 +169,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Message updated")
         return
 
-    # =========================
-    # CHAT MANAGEMENT
-    # =========================
+    # ===== CHAT MANAGEMENT =====
     if msg == "➕ Add Chat":
         user["state"] = "add_chat"
         await update.message.reply_text("Send chat id or username")
@@ -196,7 +188,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["chats"].append(msg)
         user["state"] = None
         save_data(db)
-        await update.message.reply_text("✅ Chat added")
+        await update.message.reply_text("Chat added")
         return
 
     if user["state"] == "remove_chat":
@@ -204,27 +196,27 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["chats"].remove(msg)
         user["state"] = None
         save_data(db)
-        await update.message.reply_text("✅ Chat removed")
+        await update.message.reply_text("Chat removed")
         return
 
-    # =========================
-    # INTERVAL
-    # =========================
+    # ===== INTERVAL =====
     if msg == "⏱ Interval":
         user["state"] = "interval"
         await update.message.reply_text("Send seconds")
         return
 
     if user["state"] == "interval":
-        user["interval"] = int(msg)
+        try:
+            user["interval"] = int(msg)
+        except ValueError:
+            await update.message.reply_text("Please send a valid number")
+            return
         user["state"] = None
         save_data(db)
-        await update.message.reply_text("✅ Interval updated")
+        await update.message.reply_text("Interval updated")
         return
 
-    # =========================
-    # ADS
-    # =========================
+    # ===== ADS =====
     if msg == "▶ Start Ads":
         if not user["chats"]:
             await update.message.reply_text("Add chats first")
@@ -232,18 +224,16 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["running"] = True
         save_data(db)
         context.application.create_task(ads_loop(uid))
-        await update.message.reply_text("✅ Ads started")
+        await update.message.reply_text("Ads started")
         return
 
     if msg == "⏹ Stop Ads":
         user["running"] = False
         save_data(db)
-        await update.message.reply_text("✅ Ads stopped")
+        await update.message.reply_text("Ads stopped")
         return
 
-    # =========================
-    # STATUS
-    # =========================
+    # ===== STATUS =====
     if msg == "📊 Status":
         await update.message.reply_text(
             f"Chats: {len(user['chats'])}\n"
@@ -255,15 +245,12 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================================
 # MAIN
 # =================================
-
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT, text))
-
-    print("🚀 AdBot running smoothly")
+    print("🚀 Bot running smoothly")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
