@@ -72,135 +72,94 @@ def main_buttons():
     ]
 
 
-# ================= CLIENT =================
+clients = {}
 
 async def get_client(uid):
     if uid in clients:
-        c = clients[uid]
-        if not c.is_connected():
-            await c.connect()
-        return c
+        return clients[uid]
 
-    client = TelegramClient(f"{SESSIONS_DIR}/{uid}", API_ID, API_HASH)
+    client = TelegramClient(
+        f"sessions/{uid}",   # separate session per user
+        API_ID,
+        API_HASH
+    )
+
     await client.connect()
+
+    if not await client.is_user_authorized():
+        clients[uid] = client
+        return client
+
+    await client.start()
 
     clients[uid] = client
     return client
 
-
 # ================= LOGIN =================
-
-# ================= LOGIN =================
-
+# ================== LOGIN ==================
 @bot.on(events.NewMessage(pattern="📱 Login"))
 async def login(e):
     uid = e.sender_id
-
-    states[uid] = {
-        "step": "phone",
-        "phone": None,
-        "hash": None
-    }
+    states[uid] = {"step": "phone", "phone": None, "hash": None}
 
     await e.reply(
-        "📱 Send phone number with country code\nExample:\n+919999999999"
+        "📱 Send your phone number with country code\nExample:\n+919999999999"
     )
 
-
+# OTP & 2FA handler (ignores button presses)
 @bot.on(events.NewMessage(func=lambda e: e.sender_id in states))
 async def otp_handler(e):
     uid = e.sender_id
+    text = e.raw_text.strip()
+    st = states[uid]
+    client = await get_client(uid)
 
-    if uid not in states:
+    # Ignore button clicks while in login steps
+    ignore_buttons = {
+        "📱 Login", "🚪 Logout", "➕ Add Chat", "➖ Remove Chat",
+        "📋 List Chats", "✏️ Set Message", "▶️ Start Ads", "⏹ Stop Ads",
+        "⏱ Interval", "📊 Status"
+    }
+    if text in ignore_buttons:
         return
 
-    st = states[uid]
-
-    # ---------------- PHONE STEP ----------------
+    # ----- PHONE STEP -----
     if st["step"] == "phone":
-        phone = e.raw_text.strip()
-
-        if not phone.startswith("+"):
-            await e.reply("❌ Invalid format\nUse: +919999999999")
-            return
-
         try:
-            client = await get_client(uid)
-
-            if not client.is_connected():
-                await client.connect()
-
+            phone = text
             result = await client.send_code_request(phone)
-
             st["phone"] = phone
             st["hash"] = result.phone_code_hash
             st["step"] = "otp"
-
-            await e.reply("📩 Send OTP like:\ncode12345")
-
+            await e.reply("Send OTP like:\ncode12345")
         except Exception as ex:
-            await e.reply(f"❌ Failed sending OTP:\n{ex}")
-
+            await e.reply(f"❌ Phone error: {ex}")
         return
 
-
-    # ---------------- OTP STEP ----------------
-    if st["step"] == "otp":
-        text = e.raw_text.strip().lower()
-
-        if not text.startswith("code"):
-            return
-
+    # ----- OTP STEP -----
+    if st["step"] == "otp" and text.lower().startswith("code"):
         code = text.replace("code", "").strip()
-
         try:
-            client = await get_client(uid)
-
-            if not client.is_connected():
-                await client.connect()
-
-            await client.sign_in(
-                st["phone"],
-                code,
-                phone_code_hash=st["hash"]
-            )
-
-            states.pop(uid, None)
-
-            await e.reply(
-                "✅ Login successful",
-                buttons=main_buttons()
-            )
-
+            await client.sign_in(st["phone"], code, phone_code_hash=st["hash"])
+            states.pop(uid)
+            await e.reply("✅ Login successful", buttons=main_buttons())
         except SessionPasswordNeededError:
             st["step"] = "2fa"
-            await e.reply("🔐 Send your 2FA password")
-
+            await e.reply("Send your 2FA password")
         except Exception as ex:
-            await e.reply(f"❌ OTP failed:\n{ex}")
-
+            await e.reply(f"❌ OTP failed: {ex}")
         return
 
-
-    # ---------------- 2FA STEP ----------------
+    # ----- 2FA STEP -----
     if st["step"] == "2fa":
         try:
-            client = await get_client(uid)
-
-            if not client.is_connected():
-                await client.connect()
-
-            await client.sign_in(password=e.raw_text.strip())
-
-            states.pop(uid, None)
-
-            await e.reply(
-                "✅ Login successful",
-                buttons=main_buttons()
-            )
-
+            await client.sign_in(password=text)
+            states.pop(uid)
+            await e.reply("✅ Login successful", buttons=main_buttons())
         except Exception as ex:
-            await e.reply(f"❌ 2FA failed:\n{ex}")
+            await e.reply(f"❌ 2FA failed: {ex}")
+        return
+
 # ================= LOGOUT =================
 
 @bot.on(events.NewMessage(pattern="🚪 Logout"))
@@ -277,54 +236,78 @@ async def toggle_logs(e):
     con.commit()
     con.close()
 
-
-# ================= ADS LOOP =================
-
+# ================== ADS LOOP ==================
 async def ads_loop(uid):
-    while uid in ads_tasks:
-        try:
-            client = await get_client(uid)
+    try:
+        client = await get_client(uid)
 
-            con = db()
-            cur = con.cursor()
-
-            cur.execute("SELECT message, interval, logs, log_chat FROM users WHERE uid=?", (uid,))
-            msg, interval, logs, log_chat = cur.fetchone()
-
-            cur.execute("SELECT chat FROM chats WHERE uid=?", (uid,))
-            chats = [x[0] for x in cur.fetchall()]
+        # Fetch user settings from DB
+        con = db()
+        cur = con.cursor()
+        cur.execute("SELECT message, interval, logs, log_chat FROM users WHERE uid=?", (uid,))
+        result = cur.fetchone()
+        if not result:
+            await client.send_message(uid, "❌ You are not registered")
             con.close()
+            return
+        msg, interval, logs, log_chat = result
 
+        cur.execute("SELECT chat FROM chats WHERE uid=?", (uid,))
+        chats = [x[0] for x in cur.fetchall()]
+        con.close()
+
+        while True:
             for c in chats:
-                await client.send_message(c, msg)
+                try:
+                    if not client.is_connected():
+                        await client.connect()
 
-                if logs and log_chat:
-                    await client.send_message(log_chat, f"Sent to {c}")
+                    await client.send_message(c, msg)
+
+                    if logs and log_chat:
+                        try:
+                            await client.send_message(log_chat, f"✅ Sent to {c}")
+                        except Exception as e:
+                            print("LOG ERROR:", e)
+
+                except Exception as e:
+                    print("SEND ERROR:", e)
+                    await asyncio.sleep(5)
 
             await asyncio.sleep(interval)
 
-        except Exception:
-            await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        print(f"Ads task for {uid} cancelled")
+        return
+    except Exception as e:
+        print("ADS LOOP ERROR:", e)
+        await asyncio.sleep(5)
 
 
-# ================= START/STOP =================
 
-@bot.on(events.NewMessage(pattern="▶ Start Ads"))
+
+# ================== START/STOP ADS ==================
+
+@bot.on(events.NewMessage(pattern="▶️ Start Ads"))
 async def start_ads(e):
     uid = e.sender_id
     if uid in ads_tasks:
+        await e.reply("⚠️ Ads already running")
         return
     ads_tasks[uid] = asyncio.create_task(ads_loop(uid))
-    await e.reply("Ads started")
+    await e.reply("✅ Ads started")
 
 
 @bot.on(events.NewMessage(pattern="⏹ Stop Ads"))
 async def stop_ads(e):
     uid = e.sender_id
-    if uid in ads_tasks:
-        ads_tasks[uid].cancel()
-        ads_tasks.pop(uid)
-    await e.reply("Ads stopped")
+    task = ads_tasks.pop(uid, None)
+    if task:
+        task.cancel()
+        await e.reply("🛑 Ads stopped")
+    else:
+        await e.reply("⚠️ Ads not running")
+
 
 
 # ================= STATUS =================
