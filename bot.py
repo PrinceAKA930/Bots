@@ -76,21 +76,13 @@ clients = {}
 
 async def get_client(uid):
     if uid in clients:
-        return clients[uid]
-
-    client = TelegramClient(
-        f"sessions/{uid}",   # separate session per user
-        API_ID,
-        API_HASH
-    )
-
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        clients[uid] = client
+        client = clients[uid]
+        if not client.is_connected():
+            await client.connect()
         return client
 
-    await client.start()
+    client = TelegramClient(f"sessions/{uid}", API_ID, API_HASH)
+    await client.connect()
 
     clients[uid] = client
     return client
@@ -111,14 +103,21 @@ async def login(e):
 async def otp_handler(e):
     uid = e.sender_id
     text = e.raw_text.strip()
-    st = states[uid]
-    client = await get_client(uid)
 
-    # Ignore button clicks while in login steps
+    st = states[uid]
+
+    # 🚫 Ignore buttons so they don't get treated as phone/OTP
     ignore_buttons = {
-        "📱 Login", "🚪 Logout", "➕ Add Chat", "➖ Remove Chat",
-        "📋 List Chats", "✏️ Set Message", "▶️ Start Ads", "⏹ Stop Ads",
-        "⏱ Interval", "📊 Status"
+        "📱 Login",
+        "🚪 Logout",
+        "➕ Add Chat",
+        "➖ Remove Chat",
+        "📋 List Chats",
+        "✏️ Set Message",
+        "▶️ Start Ads",
+        "⏹ Stop Ads",
+        "⏱ Interval",
+        "📊 Status"
     }
     if text in ignore_buttons:
         return
@@ -238,57 +237,51 @@ async def toggle_logs(e):
 
 # ================== ADS LOOP ==================
 async def ads_loop(uid):
-    try:
-        client = await get_client(uid)
+    while uid in ads_tasks:
+        try:
+            client = await get_client(uid)
+            if not client.is_connected():
+                await client.connect()
 
-        # Fetch user settings from DB
-        con = db()
-        cur = con.cursor()
-        cur.execute("SELECT message, interval, logs, log_chat FROM users WHERE uid=?", (uid,))
-        result = cur.fetchone()
-        if not result:
-            await client.send_message(uid, "❌ You are not registered")
+            # Fetch user settings
+            con = db()
+            cur = con.cursor()
+            cur.execute("SELECT message, interval, logs, log_chat FROM users WHERE uid=?", (uid,))
+            row = cur.fetchone()
+            if not row:
+                await client.send_message(uid, "❌ You are not registered")
+                con.close()
+                return
+            msg, interval, logs, log_chat = row
+
+            cur.execute("SELECT chat FROM chats WHERE uid=?", (uid,))
+            chats = [x[0] for x in cur.fetchall()]
             con.close()
-            return
-        msg, interval, logs, log_chat = result
 
-        cur.execute("SELECT chat FROM chats WHERE uid=?", (uid,))
-        chats = [x[0] for x in cur.fetchall()]
-        con.close()
-
-        while True:
             for c in chats:
                 try:
-                    if not client.is_connected():
-                        await client.connect()
-
                     await client.send_message(c, msg)
-
                     if logs and log_chat:
                         try:
                             await client.send_message(log_chat, f"✅ Sent to {c}")
                         except Exception as e:
                             print("LOG ERROR:", e)
-
                 except Exception as e:
-                    print("SEND ERROR:", e)
-                    await asyncio.sleep(5)
+                    print(f"SEND ERROR to {c}:", e)
 
             await asyncio.sleep(interval)
 
-    except asyncio.CancelledError:
-        print(f"Ads task for {uid} cancelled")
-        return
-    except Exception as e:
-        print("ADS LOOP ERROR:", e)
-        await asyncio.sleep(5)
-
+        except asyncio.CancelledError:
+            print(f"Ads task for {uid} cancelled")
+            return
+        except Exception as e:
+            print("ADS LOOP ERROR:", e)
+            await asyncio.sleep(5)
 
 
 
 # ================== START/STOP ADS ==================
-
-@bot.on(events.NewMessage(pattern="▶️ Start Ads"))
+@bot.on(events.NewMessage(pattern="▶ Start Ads"))
 async def start_ads(e):
     uid = e.sender_id
     if uid in ads_tasks:
@@ -307,8 +300,6 @@ async def stop_ads(e):
         await e.reply("🛑 Ads stopped")
     else:
         await e.reply("⚠️ Ads not running")
-
-
 
 # ================= STATUS =================
 
